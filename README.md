@@ -1,191 +1,167 @@
 # ESP32EspNow
 
-Biblioteca para gerenciamento completo de **ESP-NOW** em sistemas com um dispositivo **central** e múltiplos **módulos** periféricos — projetada para o padrão de automação de sala de aula.
+Infraestrutura ESP-NOW **mestre/escravo** para ESP32 — genérica, sem protocolo de aplicação imposto.
 
 [![Plataforma](https://img.shields.io/badge/plataforma-ESP32-blue)](https://platformio.org)
-[![Licenca](https://img.shields.io/badge/licenca-MIT-green)](LICENSE)
-[![Versao](https://img.shields.io/badge/versao-1.0.0-orange)](library.json)
+[![Licença](https://img.shields.io/badge/licença-MIT-green)](LICENSE)
+[![Versão](https://img.shields.io/badge/versão-2.0.0-orange)](library.json)
 
 ---
 
-## Funcionalidades
+## O que a biblioteca faz
 
-| Recurso | Central | Módulo |
+| Recurso | Mestre | Escravo |
 |---|:---:|:---:|
 | Descoberta automática via broadcast | ✔ | ✔ |
-| Registro persistente de peers (NVS) | ✔ | — |
-| Envio por MAC, ID lógico ou label | ✔ | — |
-| Envio para todos de um tipo | ✔ | — |
+| Registro persistente no NVS | ✔ | — |
+| Envio por MAC / ID / label / tipo / todos | ✔ | — |
 | Recepção com buffer ISR seguro | ✔ | ✔ |
-| Heartbeat periódico com detecção offline | ✔ | ✔ |
-| Relatório de status tipado | — | ✔ |
-| Integração com ESP32Connectivity | ✔ | — |
-| Integração com DebugManager | ✔ | ✔ |
+| Heartbeat + detecção de offline/online | ✔ | ✔ |
+| Payload completamente livre | ✔ | ✔ |
+
+## O que o **projeto** define
+
+- Tipos de dispositivo (enum, constantes)
+- Structs de comando e resposta
+- Lógica de roteamento (MQTT, HTTP, Serial...)
+- Interpretação do payload recebido
 
 ---
 
 ## Instalação
 
 ```ini
-; platformio.ini
 lib_deps =
     https://github.com/professorThiago/ESP32EspNow
-    https://github.com/professorThiago/DebugManager
 ```
 
 ---
 
-## Protocolo de mensagens
+## Uso mínimo
 
-Todo pacote começa com um `CabecalhoMsg` de 7 bytes:
-
-```
-[ versao(1) | tipo(1) | moduloId(1) | timestamp(4) ]
-```
-
-### Tipos de mensagem
-
-| Constante | Hex | Direção | Descrição |
-|---|---|---|---|
-| `TipoMsg::PING` | 0x01 | Central → broadcast | Início da descoberta |
-| `TipoMsg::PONG` | 0x02 | Módulo → central | Resposta com tipo e label |
-| `TipoMsg::CMD_AC` | 0x10 | Central → módulo | Comando ar condicionado |
-| `TipoMsg::CMD_PROJETOR` | 0x11 | Central → módulo | Comando projetor Epson |
-| `TipoMsg::CMD_TV` | 0x12 | Central → módulo | Comando TV LG |
-| `TipoMsg::CMD_TELA` | 0x13 | Central → módulo | Comando tela RF 433 |
-| `TipoMsg::CMD_LUZES` | 0x14 | Central → módulo | Comando lâmpadas SSR |
-| `TipoMsg::STATUS` | 0x20 | Módulo → central | Relatório de estado |
-| `TipoMsg::PING_HEARTBEAT` | 0xF0 | Central → módulo | Verificação periódica |
-| `TipoMsg::PONG_HEARTBEAT` | 0xF1 | Módulo → central | Resposta ao heartbeat |
-
----
-
-## Uso rápido — Central
+### Mestre
 
 ```cpp
 #include <ESP32EspNow.h>
 
-EspNowCentral central;
+EspNowMestre mestre;
 
 void setup() {
-    configurarDebug(DEBUG_INFO, -1);
+    mestre.begin("meu-sistema");
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin("rede", "senha");
-    while (WiFi.status() != WL_CONNECTED) delay(100);
-
-    central.begin("sala-01");
-
-    central.aoEncontrarModulo([](const InfoModulo& m) {
-        debugInfo("Encontrado: " + String(m.label));
-        central.registrarModulo(m);
+    mestre.aoEncontrarDispositivo([](const Dispositivo& d) {
+        Serial.println("Encontrado: " + String(d.label));
+        mestre.registrar(d);
     });
 
-    central.aoReceberStatus([](const InfoModulo& m, const MsgStatus& s) {
-        debugInfo("Status de " + String(m.label) +
-                  " | RSSI: " + String(s.rssi));
+    mestre.aoReceberMensagem([](const Dispositivo& d,
+                                 const uint8_t* dados, uint8_t tam) {
+        // interprete dados conforme seu protocolo
     });
 
-    central.aoModuloOffline([](const InfoModulo& m) {
-        debugAviso(String(m.label) + " offline!");
-    });
-
-    central.configurarHeartbeat(30000);
-    central.iniciarDescoberta();
+    mestre.iniciarDescoberta();
 }
 
-void loop() { central.atualizar(); }
+void loop() { mestre.atualizar(); }
 ```
 
----
-
-## Uso rápido — Módulo
+### Escravo
 
 ```cpp
 #include <ESP32EspNow.h>
 
-EspNowModulo modulo;
+EspNowEscravo escravo;
 
 void setup() {
-    configurarDebug(DEBUG_INFO, -1);
-    modulo.begin(TipoModulo::LUZES_RELE, "LUZ-01");
+    escravo.begin(1, "sensor-01");   // tipo=1, label="sensor-01"
 
-    modulo.aoReceberComando([](const uint8_t* dados, uint8_t tam) {
-        if (tam < sizeof(MsgCmdLuzes)) return;
-        MsgCmdLuzes cmd;
-        memcpy(&cmd, dados, sizeof(cmd));
-        // executa...
-        uint8_t estado[8] = {0x0F, 4}; // todos ligados, 4 canais
-        modulo.reportarStatus(estado);
+    escravo.aoReceberMensagem([](const uint8_t* dados, uint8_t tam) {
+        uint8_t resposta[] = {0x01, 0xFF};
+        escravo.responder(resposta, sizeof(resposta));
     });
 }
 
-void loop() { modulo.atualizar(); }
+void loop() { escravo.atualizar(); }
 ```
 
 ---
 
-## Envio de comandos — formas disponíveis
+## Envio no mestre — formas disponíveis
 
 ```cpp
-MsgCmdLuzes cmd;
-cmd.mascaraCanal = 0x0F;
-cmd.estado = 1;
-
 // Por MAC
-uint8_t mac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
-central.enviarPorMac(mac, cmd);
+mestre.enviarPorMac(mac, &cmd, sizeof(cmd));
 
 // Por ID lógico (atribuído no registro)
-central.enviarPorId(2, cmd);
+mestre.enviarPorId(2, &cmd, sizeof(cmd));
 
 // Por label
-central.enviarComando("LUZ-01", cmd);
+mestre.enviarPorLabel("sensor-01", &cmd, sizeof(cmd));
 
 // Para todos de um tipo
-central.enviarParaTodos(TipoModulo::LUZES_RELE, cmd);
+mestre.enviarParaTipo(TIPO_SENSOR, &cmd, sizeof(cmd));
+
+// Para todos os registrados
+mestre.enviarParaTodos(&cmd, sizeof(cmd));
 ```
-
----
-
-## Tipos de módulo
-
-| Constante | Descrição |
-|---|---|
-| `TipoModulo::AR_CONDICIONADO` | IR Fujitsu ARRAH2E |
-| `TipoModulo::PROJETOR_IR` | IR Epson (biblioteca EpsonIR) |
-| `TipoModulo::TV_LG_IR` | IR LG NEC 32-bit |
-| `TipoModulo::TELA_RF433` | RF 433 MHz (biblioteca TelaProjecaoRF) |
-| `TipoModulo::LUZES_RELE` | Relé de estado sólido GPIO |
 
 ---
 
 ## Constantes configuráveis
 
-Redefina **antes** do `#include` para personalizar sem alterar a biblioteca:
+Redefina **antes** do `#include`:
 
 ```cpp
-#define ESPNOW_MAX_MODULOS   20   // máximo de módulos registrados
-#define ESPNOW_MAX_LABEL     17   // tamanho máximo do label
-#define ESPNOW_MAX_SALA_ID   17   // tamanho máximo do salaId
+#define ESPNOW_MAX_DISPOSITIVOS  8    // padrão: 20
+#define ESPNOW_MAX_LABEL         9    // padrão: 17 (8 chars + '\0')
+#define ESPNOW_MAX_PAYLOAD       64   // padrão: 200
+#define ESPNOW_TIMEOUT_DESCOBERTA_MS  3000  // padrão: 5000
+#define ESPNOW_INTERVALO_HEARTBEAT_MS 10000 // padrão: 30000
+#include <ESP32EspNow.h>
 ```
 
 ---
 
-## Dependências
+## Estrutura do registro
 
-```ini
-lib_deps =
-    https://github.com/professorThiago/DebugManager   ; obrigatória
+```cpp
+// Iterar todos os dispositivos
+for (uint8_t i = 0; i < mestre.registro().total(); i++) {
+    Dispositivo& d = mestre.registro().porIndice(i);
+    Serial.println(String(d.id) + ": " + d.label);
+}
+
+// Buscar por tipo
+Dispositivo* lista[10];
+uint8_t n = mestre.registro().porTipo(TIPO_SENSOR, lista, 10);
+
+// Converter MAC
+String s = RegistroDispositivos::macParaString(d.mac);
+uint8_t mac[6];
+RegistroDispositivos::stringParaMac("AA:BB:CC:DD:EE:FF", mac);
 ```
+
+---
+
+## Protocolo interno
+
+O cabeçalho de 9 bytes é **invisível ao projeto** — apenas garante que a biblioteca funcione corretamente entre diferentes instâncias. O payload a partir do byte 10 é inteiramente do projeto.
+
+---
+
+## Exemplos incluídos
+
+| Exemplo | Descrição |
+|---|---|
+| `Mestre` | Mestre completo com descoberta, envio periódico e heartbeat |
+| `Escravo` | Escravo com resposta a comandos |
+| `MestreEscravo` | Um único arquivo, compila como mestre ou escravo via `-DROLE_MESTRE` |
 
 ---
 
 ## Licença
 
-MIT License — veja [LICENSE](LICENSE)
-
----
+MIT — veja [LICENSE](LICENSE)
 
 ## Autor
 

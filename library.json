@@ -1,10 +1,10 @@
 {
   "name": "ESP32EspNow",
-  "version": "1.0.0",
-  "description": "Gerenciamento completo de ESP-NOW para ESP32: descoberta automatica de modulos, registro de peers com NVS, envio e recepcao de mensagens tipadas. Projetado para sistemas multi-modulo com um dispositivo central.",
+  "version": "2.0.0",
+  "description": "Infraestrutura ESP-NOW para sistemas mestre/escravo no ESP32. Oferece descoberta automatica de dispositivos, registro persistente no NVS e troca de mensagens com payload livre — sem impor protocolo de aplicacao.",
   "keywords": [
-    "ESP-NOW", "ESP32", "descoberta", "peers", "NVS",
-    "automacao", "sem-fio", "IoT", "sala de aula"
+    "ESP-NOW", "ESP32", "mestre", "escravo", "master", "slave",
+    "descoberta", "peers", "NVS", "IoT", "sem-fio"
   ],
   "authors": [
     {
@@ -23,14 +23,19 @@
   "build": { "srcDir": "src" },
   "examples": [
     {
-      "name": "DescobertaModulos",
-      "base": "examples/DescobertaModulos",
-      "files": ["DescobertaModulos.ino"]
+      "name": "Mestre",
+      "base": "examples/Mestre",
+      "files": ["Mestre.ino"]
     },
     {
-      "name": "SistemaCompleto",
-      "base": "examples/SistemaCompleto",
-      "files": ["SistemaCompleto.ino"]
+      "name": "Escravo",
+      "base": "examples/Escravo",
+      "files": ["Escravo.ino"]
+    },
+    {
+      "name": "MestreEscravo",
+      "base": "examples/MestreEscravo",
+      "files": ["MestreEscravo.ino"]
     }
   ]
 }

@@ -3,21 +3,51 @@
  * @brief Implementação da biblioteca ESP32EspNow.
  *
  * @author  professorThiago (https://github.com/professorThiago)
- * @version 1.0.0
+ * @version 2.0.0
  * @license MIT
  */
 
 #include "ESP32EspNow.h"
 
 // =============================================================================
-// Singletons estáticos
+// Protocolo interno — cabeçalho de 9 bytes
+// Invisível ao projeto — usado apenas entre instâncias desta biblioteca.
 // =============================================================================
 
-EspNowCentral* EspNowCentral::_instancia = nullptr;
-EspNowModulo*  EspNowModulo::_instancia  = nullptr;
+enum class _TipoInterno : uint8_t {
+    PING          = 0xA1,  // mestre → broadcast: quem está aqui?
+    PONG          = 0xA2,  // escravo → mestre: sou eu (tipo + label + fw)
+    MENSAGEM      = 0xA3,  // qualquer direção: payload livre do projeto
+    PING_HB       = 0xA4,  // mestre → escravo: heartbeat
+    PONG_HB       = 0xA5,  // escravo → mestre: resposta ao heartbeat
+};
+
+struct __attribute__((packed)) _Cabecalho {
+    uint8_t      versao  = ESPNOW_VERSAO_PROTOCOLO;
+    _TipoInterno tipo;
+    uint8_t      id      = 0;   // ID lógico do remetente (0 = não cadastrado)
+    uint32_t     ts      = 0;   // millis() do remetente
+    uint8_t      tamPayload = 0;
+};
+
+// Layout do PONG — payload fixo após o cabeçalho
+struct __attribute__((packed)) _PayloadPong {
+    uint8_t tipoDispositivo;
+    uint8_t versaoFirmware;
+    char    label[ESPNOW_MAX_LABEL];
+};
+
+static constexpr uint8_t _TAM_CAB = sizeof(_Cabecalho);
 
 // =============================================================================
-// Helpers internos (arquivo)
+// Singletons
+// =============================================================================
+
+EspNowMestre* EspNowMestre::_instancia = nullptr;
+EspNowEscravo* EspNowEscravo::_instancia = nullptr;
+
+// =============================================================================
+// Helpers internos de arquivo
 // =============================================================================
 
 static bool _macsIguais(const uint8_t a[6], const uint8_t b[6])
@@ -25,643 +55,389 @@ static bool _macsIguais(const uint8_t a[6], const uint8_t b[6])
     return memcmp(a, b, 6) == 0;
 }
 
-static bool _macBroadcast(const uint8_t mac[6])
+static void _preencherCab(_Cabecalho& cab, _TipoInterno tipo,
+                           uint8_t id = 0, uint8_t tamPayload = 0)
 {
-    for (uint8_t i = 0; i < 6; i++) if (mac[i] != 0xFF) return false;
-    return true;
+    cab.versao      = ESPNOW_VERSAO_PROTOCOLO;
+    cab.tipo        = tipo;
+    cab.id          = id;
+    cab.ts          = millis();
+    cab.tamPayload  = tamPayload;
 }
 
-static void _preencherCabecalho(CabecalhoMsg& cab, TipoMsg tipo, uint8_t id = 0)
+static bool _adicionarPeerESP(const uint8_t mac[6])
 {
-    cab.versao    = ESPNOW_VERSAO_PROTOCOLO;
-    cab.tipo      = tipo;
-    cab.moduloId  = id;
-    cab.timestamp = millis();
+    if (esp_now_is_peer_exist(mac)) return true;
+    esp_now_peer_info_t p{};
+    memcpy(p.peer_addr, mac, 6);
+    p.channel = 0;
+    p.encrypt = false;
+    return esp_now_add_peer(&p) == ESP_OK;
 }
 
 // =============================================================================
-// RegistroModulos
+// RegistroDispositivos
 // =============================================================================
 
-void RegistroModulos::begin(const char* nsNVS)
+void RegistroDispositivos::begin(const char* nsNVS)
 {
     strncpy(_ns, nsNVS, sizeof(_ns) - 1);
     _total  = 0;
     _proxId = 1;
-    memset(_modulos, 0, sizeof(_modulos));
+    memset(_dispositivos, 0, sizeof(_dispositivos));
     carregar();
-    debugInfo("[Registro] " + String(_total) + " modulo(s) carregado(s) do NVS.");
 }
 
-bool RegistroModulos::adicionar(const InfoModulo& modulo)
+bool RegistroDispositivos::adicionar(const Dispositivo& d)
 {
     // Atualiza se MAC já existe
-    InfoModulo* existente = buscarPorMac(modulo.mac);
-    if (existente) {
-        *existente = modulo;
-        if (existente->id == 0) existente->id = _gerarId();
-        _salvarModulo(existente - _modulos);
-        debugInfo("[Registro] Modulo atualizado: " + String(existente->label));
+    Dispositivo* ex = porMac(d.mac);
+    if (ex) {
+        uint8_t idSalvo = ex->id;
+        *ex = d;
+        if (ex->id == 0) ex->id = idSalvo ? idSalvo : _gerarId();
+        _salvar(ex - _dispositivos);
         return true;
     }
 
-    if (_total >= ESPNOW_MAX_MODULOS) {
-        debugErro("[Registro] Registro cheio (" +
-                  String(ESPNOW_MAX_MODULOS) + " modulos).");
-        return false;
-    }
+    if (_total >= ESPNOW_MAX_DISPOSITIVOS) return false;
 
-    _modulos[_total]    = modulo;
-    _modulos[_total].id = _gerarId();
-    _salvarModulo(_total);
+    _dispositivos[_total]    = d;
+    _dispositivos[_total].id = _gerarId();
+    _salvar(_total);
     _total++;
-
-    debugInfo("[Registro] Modulo adicionado: " + String(modulo.label) +
-              " | ID: " + String(_modulos[_total - 1].id) +
-              " | MAC: " + macParaString(modulo.mac));
     return true;
 }
 
-bool RegistroModulos::remover(uint8_t id)
+bool RegistroDispositivos::remover(uint8_t id)
 {
     for (uint8_t i = 0; i < _total; i++) {
-        if (_modulos[i].id == id) {
-            debugInfo("[Registro] Removendo modulo ID " + String(id) +
-                      " (" + String(_modulos[i].label) + ")");
+        if (_dispositivos[i].id != id) continue;
 
-            // Apaga do NVS
-            char chave[12];
-            snprintf(chave, sizeof(chave), "m%02d", i);
-            _prefs.begin(_ns, false);
-            _prefs.remove(chave);
-            _prefs.end();
+        char chave[12]; snprintf(chave, sizeof(chave), "d%02d", i);
+        _prefs.begin(_ns, false);
+        _prefs.remove(chave);
+        _prefs.end();
 
-            // Compacta array
-            for (uint8_t j = i; j < _total - 1; j++) {
-                _modulos[j] = _modulos[j + 1];
-            }
-            memset(&_modulos[_total - 1], 0, sizeof(InfoModulo));
-            _total--;
-            salvar(); // salva estado completo
-            return true;
-        }
+        for (uint8_t j = i; j < _total - 1; j++)
+            _dispositivos[j] = _dispositivos[j + 1];
+        memset(&_dispositivos[_total - 1], 0, sizeof(Dispositivo));
+        _total--;
+        salvar();
+        return true;
     }
-    debugAviso("[Registro] ID " + String(id) + " nao encontrado para remocao.");
     return false;
 }
 
-void RegistroModulos::limpar()
+void RegistroDispositivos::limpar()
 {
     _prefs.begin(_ns, false);
     _prefs.clear();
     _prefs.end();
-    memset(_modulos, 0, sizeof(_modulos));
+    memset(_dispositivos, 0, sizeof(_dispositivos));
     _total  = 0;
     _proxId = 1;
-    debugInfo("[Registro] Registro limpo.");
 }
 
-InfoModulo* RegistroModulos::buscarPorMac(const uint8_t mac[6])
+Dispositivo* RegistroDispositivos::porMac(const uint8_t mac[6])
 {
-    for (uint8_t i = 0; i < _total; i++) {
-        if (_macsIguais(_modulos[i].mac, mac)) return &_modulos[i];
-    }
+    for (uint8_t i = 0; i < _total; i++)
+        if (_macsIguais(_dispositivos[i].mac, mac)) return &_dispositivos[i];
     return nullptr;
 }
 
-InfoModulo* RegistroModulos::buscarPorId(uint8_t id)
+Dispositivo* RegistroDispositivos::porId(uint8_t id)
 {
-    for (uint8_t i = 0; i < _total; i++) {
-        if (_modulos[i].id == id) return &_modulos[i];
-    }
+    for (uint8_t i = 0; i < _total; i++)
+        if (_dispositivos[i].id == id) return &_dispositivos[i];
     return nullptr;
 }
 
-uint8_t RegistroModulos::buscarPorTipo(TipoModulo tipo,
-                                        InfoModulo** saida,
-                                        uint8_t maxSaida)
+Dispositivo* RegistroDispositivos::porLabel(const char* label)
+{
+    for (uint8_t i = 0; i < _total; i++)
+        if (strncmp(_dispositivos[i].label, label, ESPNOW_MAX_LABEL) == 0)
+            return &_dispositivos[i];
+    return nullptr;
+}
+
+uint8_t RegistroDispositivos::porTipo(uint8_t tipo,
+                                        Dispositivo** saida, uint8_t maxSaida)
 {
     uint8_t n = 0;
-    for (uint8_t i = 0; i < _total && n < maxSaida; i++) {
-        if (_modulos[i].tipo == tipo) saida[n++] = &_modulos[i];
-    }
+    for (uint8_t i = 0; i < _total && n < maxSaida; i++)
+        if (_dispositivos[i].tipoDispositivo == tipo) saida[n++] = &_dispositivos[i];
     return n;
 }
 
-InfoModulo& RegistroModulos::obterPorIndice(uint8_t indice)
+Dispositivo& RegistroDispositivos::porIndice(uint8_t i)
 {
-    // Proteção contra acesso fora dos limites
-    if (indice >= _total) indice = 0;
-    return _modulos[indice];
+    if (i >= _total) i = 0;
+    return _dispositivos[i];
 }
 
-void RegistroModulos::salvar()
+void RegistroDispositivos::salvar()
 {
     _prefs.begin(_ns, false);
     _prefs.putUChar("total",  _total);
     _prefs.putUChar("proxId", _proxId);
     _prefs.end();
-
-    for (uint8_t i = 0; i < _total; i++) _salvarModulo(i);
-
-    debugVerbose("[Registro] " + String(_total) + " modulo(s) salvos no NVS.");
+    for (uint8_t i = 0; i < _total; i++) _salvar(i);
 }
 
-void RegistroModulos::carregar()
+void RegistroDispositivos::carregar()
 {
     _prefs.begin(_ns, true);
     _total  = _prefs.getUChar("total",  0);
     _proxId = _prefs.getUChar("proxId", 1);
     _prefs.end();
-
-    if (_total > ESPNOW_MAX_MODULOS) _total = ESPNOW_MAX_MODULOS;
-
-    for (uint8_t i = 0; i < _total; i++) _carregarModulo(i);
+    if (_total > ESPNOW_MAX_DISPOSITIVOS) _total = ESPNOW_MAX_DISPOSITIVOS;
+    for (uint8_t i = 0; i < _total; i++) _carregar(i);
 }
 
-void RegistroModulos::_salvarModulo(uint8_t indice)
+void RegistroDispositivos::_salvar(uint8_t i)
 {
-    char chave[12];
-    snprintf(chave, sizeof(chave), "m%02d", indice);
-
+    char chave[12]; snprintf(chave, sizeof(chave), "d%02d", i);
     _prefs.begin(_ns, false);
-    _prefs.putBytes(chave, &_modulos[indice], sizeof(InfoModulo));
+    _prefs.putBytes(chave, &_dispositivos[i], sizeof(Dispositivo));
     _prefs.putUChar("total",  _total);
     _prefs.putUChar("proxId", _proxId);
     _prefs.end();
 }
 
-void RegistroModulos::_carregarModulo(uint8_t indice)
+void RegistroDispositivos::_carregar(uint8_t i)
 {
-    char chave[12];
-    snprintf(chave, sizeof(chave), "m%02d", indice);
-
+    char chave[12]; snprintf(chave, sizeof(chave), "d%02d", i);
     _prefs.begin(_ns, true);
-    size_t lido = _prefs.getBytes(chave, &_modulos[indice], sizeof(InfoModulo));
+    size_t lido = _prefs.getBytes(chave, &_dispositivos[i], sizeof(Dispositivo));
     _prefs.end();
-
-    if (lido != sizeof(InfoModulo)) {
-        memset(&_modulos[indice], 0, sizeof(InfoModulo));
-        debugAviso("[Registro] Falha ao carregar modulo " + String(indice));
-    }
+    if (lido != sizeof(Dispositivo)) memset(&_dispositivos[i], 0, sizeof(Dispositivo));
 }
 
-uint8_t RegistroModulos::_gerarId()
+uint8_t RegistroDispositivos::_gerarId()
 {
     uint8_t id = _proxId++;
-    if (_proxId > ESPNOW_MAX_MODULOS) _proxId = 1;
+    if (_proxId > ESPNOW_MAX_DISPOSITIVOS) _proxId = 1;
     return id;
 }
 
-String RegistroModulos::macParaString(const uint8_t mac[6])
+String RegistroDispositivos::macParaString(const uint8_t mac[6])
 {
     char buf[18];
-    snprintf(buf, sizeof(buf),
-             "%02X:%02X:%02X:%02X:%02X:%02X",
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return String(buf);
 }
 
-const char* RegistroModulos::nomeTipo(TipoModulo tipo)
+bool RegistroDispositivos::stringParaMac(const char* str, uint8_t mac[6])
 {
-    switch (tipo) {
-        case TipoModulo::AR_CONDICIONADO: return "AR_CONDICIONADO";
-        case TipoModulo::PROJETOR_IR:     return "PROJETOR_IR";
-        case TipoModulo::TV_LG_IR:        return "TV_LG_IR";
-        case TipoModulo::TELA_RF433:      return "TELA_RF433";
-        case TipoModulo::LUZES_RELE:      return "LUZES_RELE";
-        default:                          return "DESCONHECIDO";
-    }
+    return sscanf(str, "%hhX:%hhX:%hhX:%hhX:%hhX:%hhX",
+                  &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6;
 }
 
 // =============================================================================
-// EspNowCentral — inicialização
+// EspNowMestre — inicialização
 // =============================================================================
 
-bool EspNowCentral::begin(const char* salaId, const char* nsNVS)
+bool EspNowMestre::begin(const char* sistemaId, const char* nsNVS)
 {
     _instancia = this;
-    strncpy(_salaId, salaId, ESPNOW_MAX_SALA_ID - 1);
+    strncpy(_sistemaId, sistemaId, ESPNOW_MAX_SISTEMA_ID - 1);
 
     WiFi.mode(WIFI_STA);
     WiFi.macAddress(_mac);
 
-    if (esp_now_init() != ESP_OK) {
-        debugErro("[EspNowCentral] Falha em esp_now_init()!");
-        return false;
-    }
+    if (esp_now_init() != ESP_OK) return false;
 
-    esp_now_register_recv_cb(_cbRecvEstatico);
-    esp_now_register_send_cb(_cbSendEstatico);
+    esp_now_register_recv_cb(_onRecv);
+    esp_now_register_send_cb(_onSend);
 
     _registro.begin(nsNVS);
 
-    // Registra todos os módulos já conhecidos como peers ESP-NOW
-    for (uint8_t i = 0; i < _registro.total(); i++) {
-        _adicionarPeer(_registro.obterPorIndice(i).mac);
-    }
-
-    debugInfo("[EspNowCentral] Iniciado — sala: " + String(_salaId));
-    debugInfo("[EspNowCentral] MAC: " + mac());
-    debugInfo("[EspNowCentral] Canal: " + String(canal()));
-    debugInfo("[EspNowCentral] Modulos registrados: " + String(_registro.total()));
+    // Reregistra todos os peers salvos
+    for (uint8_t i = 0; i < _registro.total(); i++)
+        _adicionarPeer(_registro.porIndice(i).mac);
 
     return true;
 }
 
 // =============================================================================
-// EspNowCentral — loop
+// EspNowMestre — loop
 // =============================================================================
 
-void EspNowCentral::atualizar()
+void EspNowMestre::atualizar()
 {
-    _processarBuffer();
+    _processar();
     _verificarTimeoutDescoberta();
 
     if (_intervaloHeartbeat > 0 &&
         millis() - _ultimoHeartbeat >= _intervaloHeartbeat) {
         _ultimoHeartbeat = millis();
         enviarHeartbeat();
-        _verificarModulosOffline();
+        _verificarOffline();
     }
 }
 
 // =============================================================================
-// EspNowCentral — descoberta
+// EspNowMestre — descoberta
 // =============================================================================
 
-void EspNowCentral::iniciarDescoberta(uint32_t timeoutMs)
+void EspNowMestre::iniciarDescoberta(uint32_t timeoutMs)
 {
-    _descobertaAtiva    = true;
-    _inicioDescoberta   = millis();
-    _timeoutDescoberta  = timeoutMs;
+    _descobertaAtiva   = true;
+    _inicioDescoberta  = millis();
+    _timeoutDescoberta = timeoutMs;
 
-    // Adiciona broadcast como peer temporário
-    uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    if (!esp_now_is_peer_exist(broadcast)) {
-        esp_now_peer_info_t peer{};
-        memcpy(peer.peer_addr, broadcast, 6);
-        peer.channel = 0;
-        peer.encrypt = false;
-        esp_now_add_peer(&peer);
-    }
+    static const uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    _adicionarPeer(broadcast);
 
-    MsgPing ping;
-    _preencherCabecalho(ping.cabecalho, TipoMsg::PING);
-    _enviar(broadcast, reinterpret_cast<const uint8_t*>(&ping), sizeof(ping));
-
-    debugInfo("[EspNowCentral] Descoberta iniciada (" +
-              String(timeoutMs) + " ms)...");
+    uint8_t buf[_TAM_CAB];
+    _Cabecalho cab;
+    _preencherCab(cab, _TipoInterno::PING);
+    memcpy(buf, &cab, _TAM_CAB);
+    _enviar(broadcast, buf, _TAM_CAB);
 }
 
-bool EspNowCentral::descobertaAtiva() const { return _descobertaAtiva; }
+bool EspNowMestre::descobertaAtiva() const { return _descobertaAtiva; }
 
-void EspNowCentral::_verificarTimeoutDescoberta()
+void EspNowMestre::_verificarTimeoutDescoberta()
 {
-    if (!_descobertaAtiva) return;
-    if (millis() - _inicioDescoberta >= _timeoutDescoberta) {
+    if (_descobertaAtiva &&
+        millis() - _inicioDescoberta >= _timeoutDescoberta) {
         _descobertaAtiva = false;
-        debugInfo("[EspNowCentral] Descoberta encerrada.");
     }
 }
 
 // =============================================================================
-// EspNowCentral — gerenciamento de módulos
+// EspNowMestre — gerenciamento
 // =============================================================================
 
-bool EspNowCentral::registrarModulo(const InfoModulo& modulo)
+bool EspNowMestre::registrar(const Dispositivo& d)
 {
-    if (!_registro.adicionar(modulo)) return false;
-    _adicionarPeer(modulo.mac);
+    if (!_registro.adicionar(d)) return false;
+    _adicionarPeer(d.mac);
     return true;
 }
 
-bool EspNowCentral::removerModulo(uint8_t id)
+bool EspNowMestre::remover(uint8_t id)
 {
-    InfoModulo* m = _registro.buscarPorId(id);
-    if (!m) return false;
-
-    esp_now_del_peer(m->mac);
+    Dispositivo* d = _registro.porId(id);
+    if (!d) return false;
+    esp_now_del_peer(d->mac);
     return _registro.remover(id);
 }
 
-void EspNowCentral::limparModulos()
+void EspNowMestre::limpar()
 {
-    for (uint8_t i = 0; i < _registro.total(); i++) {
-        esp_now_del_peer(_registro.obterPorIndice(i).mac);
-    }
+    for (uint8_t i = 0; i < _registro.total(); i++)
+        esp_now_del_peer(_registro.porIndice(i).mac);
     _registro.limpar();
 }
 
 // =============================================================================
-// EspNowCentral — heartbeat
+// EspNowMestre — envio
 // =============================================================================
 
-void EspNowCentral::configurarHeartbeat(uint32_t intervaloMs)
+bool EspNowMestre::enviarPorMac(const uint8_t mac[6],
+                                  const void* dados, uint8_t tamanho)
 {
-    _intervaloHeartbeat = intervaloMs;
-    debugVerbose("[EspNowCentral] Heartbeat: " +
-                 (intervaloMs ? String(intervaloMs) + " ms" : String("desabilitado")));
+    if (tamanho > ESPNOW_MAX_PAYLOAD) tamanho = ESPNOW_MAX_PAYLOAD;
+
+    uint8_t buf[_TAM_CAB + ESPNOW_MAX_PAYLOAD];
+    _Cabecalho cab;
+    _preencherCab(cab, _TipoInterno::MENSAGEM, 0, tamanho);
+    memcpy(buf, &cab, _TAM_CAB);
+    memcpy(buf + _TAM_CAB, dados, tamanho);
+    return _enviar(mac, buf, _TAM_CAB + tamanho);
 }
 
-void EspNowCentral::enviarHeartbeat()
+bool EspNowMestre::enviarPorId(uint8_t id, const void* dados, uint8_t tamanho)
 {
-    if (_registro.total() == 0) return;
-
-    MsgHeartbeat hb;
-    _preencherCabecalho(hb.cabecalho, TipoMsg::PING_HEARTBEAT);
-
-    uint8_t enviados = 0;
-    for (uint8_t i = 0; i < _registro.total(); i++) {
-        if (_enviar(_registro.obterPorIndice(i).mac,
-                    reinterpret_cast<const uint8_t*>(&hb), sizeof(hb))) {
-            enviados++;
-        }
-    }
-    debugVerbose("[EspNowCentral] Heartbeat enviado para " +
-                 String(enviados) + " modulos.");
+    Dispositivo* d = _registro.porId(id);
+    if (!d) return false;
+    return enviarPorMac(d->mac, dados, tamanho);
 }
 
-void EspNowCentral::_verificarModulosOffline()
+bool EspNowMestre::enviarPorLabel(const char* label,
+                                    const void* dados, uint8_t tamanho)
 {
-    if (!_cbOffline || _intervaloHeartbeat == 0) return;
-
-    uint32_t limite = _intervaloHeartbeat * 3;
-    for (uint8_t i = 0; i < _registro.total(); i++) {
-        InfoModulo& m = _registro.obterPorIndice(i);
-        bool eriaOnline = m.online;
-
-        if (millis() - m.ultimoContato > limite) {
-            if (m.online) {
-                m.online = false;
-                debugAviso("[EspNowCentral] Modulo offline: " + String(m.label));
-                if (_cbOffline) _cbOffline(m);
-            }
-        }
-    }
+    Dispositivo* d = _registro.porLabel(label);
+    if (!d) return false;
+    return enviarPorMac(d->mac, dados, tamanho);
 }
 
-// =============================================================================
-// EspNowCentral — utilitários
-// =============================================================================
-
-uint8_t EspNowCentral::canal() const
+uint8_t EspNowMestre::enviarParaTipo(uint8_t tipo,
+                                      const void* dados, uint8_t tamanho)
 {
-    return WiFi.channel();
-}
-
-// =============================================================================
-// EspNowCentral — processamento de buffer (ISR → loop)
-// =============================================================================
-
-void EspNowCentral::_processarBuffer()
-{
-    if (!_temDados) return;
-
-    uint8_t  buf[250];
-    int      tam;
-    uint8_t  macOrigem[6];
-
-    noInterrupts();
-    tam = _tamanhoRx;
-    memcpy(buf, _bufferRx, tam);
-    memcpy(macOrigem, _macRx, 6);
-    _temDados = false;
-    interrupts();
-
-    if (tam < (int)sizeof(CabecalhoMsg)) return;
-
-    CabecalhoMsg cab;
-    memcpy(&cab, buf, sizeof(cab));
-
-    if (cab.versao != ESPNOW_VERSAO_PROTOCOLO) {
-        debugAviso("[EspNowCentral] Versao de protocolo incompativel: " +
-                   String(cab.versao));
-        return;
-    }
-
-    // Atualiza timestamp de contato do módulo
-    InfoModulo* m = _registro.buscarPorMac(macOrigem);
-    if (m) {
-        m->online        = true;
-        m->ultimoContato = millis();
-    }
-
-    switch (cab.tipo) {
-        case TipoMsg::PONG: {
-            if (tam < (int)sizeof(MsgPong)) return;
-            MsgPong pong;
-            memcpy(&pong, buf, sizeof(pong));
-            _processarPong(macOrigem, pong);
-            break;
-        }
-        case TipoMsg::STATUS: {
-            if (tam < (int)sizeof(MsgStatus)) return;
-            MsgStatus status;
-            memcpy(&status, buf, sizeof(status));
-            _processarStatus(macOrigem, status);
-            break;
-        }
-        case TipoMsg::PONG_HEARTBEAT: {
-            _processarHeartbeatPong(macOrigem);
-            break;
-        }
-        default:
-            debugVerbose("[EspNowCentral] TipoMsg desconhecido: 0x" +
-                         String((uint8_t)cab.tipo, HEX));
-            break;
-    }
-}
-
-void EspNowCentral::_processarPong(const uint8_t* macOrigem, const MsgPong& pong)
-{
-    debugInfo("[EspNowCentral] PONG de " +
-              RegistroModulos::macParaString(macOrigem) +
-              " — " + String(pong.label) +
-              " (" + RegistroModulos::nomeTipo(pong.tipo) + ")");
-
-    // Monta InfoModulo para o callback
-    InfoModulo info{};
-    memcpy(info.mac, macOrigem, 6);
-    info.tipo           = pong.tipo;
-    info.id             = 0; // será atribuído em registrarModulo()
-    info.versaoFirmware = pong.versaoFirmware;
-    info.online         = true;
-    info.ultimoContato  = millis();
-    strncpy(info.label, pong.label, ESPNOW_MAX_LABEL - 1);
-
-    // Verifica se já está cadastrado
-    bool jaRegistrado = (_registro.buscarPorMac(macOrigem) != nullptr);
-    if (jaRegistrado) {
-        debugVerbose("[EspNowCentral] Modulo ja registrado, atualizando contato.");
-        InfoModulo* m = _registro.buscarPorMac(macOrigem);
-        m->online        = true;
-        m->ultimoContato = millis();
-        return;
-    }
-
-    if (_cbEncontrado) _cbEncontrado(info);
-}
-
-void EspNowCentral::_processarStatus(const uint8_t* macOrigem, const MsgStatus& status)
-{
-    InfoModulo* m = _registro.buscarPorMac(macOrigem);
-    if (!m) {
-        debugAviso("[EspNowCentral] STATUS de modulo nao registrado: " +
-                   RegistroModulos::macParaString(macOrigem));
-        return;
-    }
-
-    debugVerbose("[EspNowCentral] STATUS de " + String(m->label) +
-                 " — RSSI: " + String(status.rssi));
-
-    if (_cbStatus) _cbStatus(*m, status);
-}
-
-void EspNowCentral::_processarHeartbeatPong(const uint8_t* macOrigem)
-{
-    InfoModulo* m = _registro.buscarPorMac(macOrigem);
-    if (m) {
-        m->online        = true;
-        m->ultimoContato = millis();
-        debugVerbose("[EspNowCentral] Heartbeat PONG de " + String(m->label));
-    }
-}
-
-// =============================================================================
-// EspNowCentral — internos de envio
-// =============================================================================
-
-bool EspNowCentral::_adicionarPeer(const uint8_t mac[6])
-{
-    if (esp_now_is_peer_exist(mac)) return true;
-
-    esp_now_peer_info_t peer{};
-    memcpy(peer.peer_addr, mac, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-
-    bool ok = (esp_now_add_peer(&peer) == ESP_OK);
-    if (!ok) {
-        debugErro("[EspNowCentral] Falha ao adicionar peer: " +
-                  RegistroModulos::macParaString(mac));
-    }
+    Dispositivo* lista[ESPNOW_MAX_DISPOSITIVOS];
+    uint8_t n = _registro.porTipo(tipo, lista, ESPNOW_MAX_DISPOSITIVOS);
+    uint8_t ok = 0;
+    for (uint8_t i = 0; i < n; i++)
+        if (enviarPorMac(lista[i]->mac, dados, tamanho)) ok++;
     return ok;
 }
 
-bool EspNowCentral::_enviar(const uint8_t mac[6],
-                              const uint8_t* dados, uint8_t tamanho)
+uint8_t EspNowMestre::enviarParaTodos(const void* dados, uint8_t tamanho)
 {
-    esp_err_t r = esp_now_send(mac, dados, tamanho);
-    if (r != ESP_OK) {
-        debugErro("[EspNowCentral] esp_now_send falhou (erro: " +
-                  String(r) + ") para " + RegistroModulos::macParaString(mac));
-        return false;
+    uint8_t ok = 0;
+    for (uint8_t i = 0; i < _registro.total(); i++)
+        if (enviarPorMac(_registro.porIndice(i).mac, dados, tamanho)) ok++;
+    return ok;
+}
+
+// =============================================================================
+// EspNowMestre — heartbeat
+// =============================================================================
+
+void EspNowMestre::configurarHeartbeat(uint32_t intervaloMs)
+{
+    _intervaloHeartbeat = intervaloMs;
+}
+
+void EspNowMestre::enviarHeartbeat()
+{
+    uint8_t buf[_TAM_CAB];
+    _Cabecalho cab;
+    _preencherCab(cab, _TipoInterno::PING_HB);
+    memcpy(buf, &cab, _TAM_CAB);
+
+    for (uint8_t i = 0; i < _registro.total(); i++)
+        _enviar(_registro.porIndice(i).mac, buf, _TAM_CAB);
+}
+
+void EspNowMestre::_verificarOffline()
+{
+    if (_intervaloHeartbeat == 0) return;
+    uint32_t limite = _intervaloHeartbeat * 3;
+    for (uint8_t i = 0; i < _registro.total(); i++) {
+        Dispositivo& d = _registro.porIndice(i);
+        bool eraOnline = d.online;
+        if (millis() - d.ultimoContato > limite) {
+            if (d.online) {
+                d.online = false;
+                if (_cbOffline) _cbOffline(d);
+            }
+        } else if (!eraOnline) {
+            d.online = true;
+            if (_cbOnline) _cbOnline(d);
+        }
     }
-    return true;
 }
 
 // =============================================================================
-// EspNowCentral — callbacks estáticos (ISR-safe)
+// EspNowMestre — utilitários
 // =============================================================================
 
-void EspNowCentral::_cbRecvEstatico(const esp_now_recv_info_t* info,
-                                     const uint8_t* dados, int tamanho)
+String EspNowMestre::mac() const
 {
-    if (!_instancia || _instancia->_temDados) return;
-
-    int copia = (tamanho > 250) ? 250 : tamanho;
-    memcpy((void*)_instancia->_bufferRx, dados, copia);
-    memcpy(_instancia->_macRx, info->src_addr, 6);
-    _instancia->_tamanhoRx = copia;
-    _instancia->_temDados  = true;
-}
-
-void EspNowCentral::_cbSendEstatico(const uint8_t* mac,
-                                     esp_now_send_status_t status)
-{
-    if (!_instancia) return;
-    bool ok = (status == ESP_NOW_SEND_SUCCESS);
-
-    if (!ok) {
-        debugAviso("[EspNowCentral] Falha de entrega para: " +
-                   RegistroModulos::macParaString(mac));
-    }
-    if (_instancia->_cbEnvio) _instancia->_cbEnvio(mac, ok);
+    return RegistroDispositivos::macParaString(_mac);
 }
 
 // =============================================================================
-// EspNowModulo — inicialização
+// EspNowMestre — processamento do buffer
 // =============================================================================
 
-bool EspNowModulo::begin(TipoModulo tipo, const char* label, uint8_t versaoFirmware)
-{
-    _instancia = this;
-    _tipo      = tipo;
-    strncpy(_label, label, ESPNOW_MAX_LABEL - 1);
-    _versaoFirmware = versaoFirmware;
-
-    WiFi.mode(WIFI_STA);
-    WiFi.macAddress(_mac);
-
-    if (esp_now_init() != ESP_OK) {
-        debugErro("[EspNowModulo] Falha em esp_now_init()!");
-        return false;
-    }
-
-    esp_now_register_recv_cb(_cbRecvEstatico);
-    esp_now_register_send_cb(_cbSendEstatico);
-
-    debugInfo("[EspNowModulo] Iniciado — label: " + String(_label) +
-              " | tipo: " + RegistroModulos::nomeTipo(_tipo));
-    debugInfo("[EspNowModulo] MAC: " + mac());
-    debugInfo("[EspNowModulo] Aguardando PING do central...");
-
-    return true;
-}
-
-// =============================================================================
-// EspNowModulo — loop
-// =============================================================================
-
-void EspNowModulo::atualizar()
-{
-    _processarBuffer();
-}
-
-// =============================================================================
-// EspNowModulo — comunicação
-// =============================================================================
-
-bool EspNowModulo::reportarStatus(const uint8_t payloadEstado[8])
-{
-    if (!_centralRegistrado) {
-        debugAviso("[EspNowModulo] reportarStatus: central nao registrado.");
-        return false;
-    }
-
-    MsgStatus status;
-    _preencherCabecalho(status.cabecalho, TipoMsg::STATUS, _id);
-    status.tipo = _tipo;
-    memcpy(status.payloadEstado, payloadEstado, 8);
-    status.rssi = WiFi.RSSI();
-
-    return _enviar(_macCentral,
-                   reinterpret_cast<const uint8_t*>(&status),
-                   sizeof(status));
-}
-
-String EspNowModulo::macCentral() const
-{
-    if (!_centralRegistrado) return "";
-    return RegistroModulos::macParaString(_macCentral);
-}
-
-// =============================================================================
-// EspNowModulo — processamento de buffer
-// =============================================================================
-
-void EspNowModulo::_processarBuffer()
+void EspNowMestre::_processar()
 {
     if (!_temDados) return;
 
@@ -670,142 +446,311 @@ void EspNowModulo::_processarBuffer()
     uint8_t macOrigem[6];
 
     noInterrupts();
-    tam = _tamanhoRx;
-    memcpy(buf, _bufferRx, tam);
+    tam = _tamRx;
+    memcpy(buf, _bufRx, tam);
     memcpy(macOrigem, _macRx, 6);
     _temDados = false;
     interrupts();
 
-    if (tam < (int)sizeof(CabecalhoMsg)) return;
+    if (tam < _TAM_CAB) return;
 
-    CabecalhoMsg cab;
-    memcpy(&cab, buf, sizeof(cab));
+    _Cabecalho cab;
+    memcpy(&cab, buf, _TAM_CAB);
+    if (cab.versao != ESPNOW_VERSAO_PROTOCOLO) return;
 
-    if (cab.versao != ESPNOW_VERSAO_PROTOCOLO) {
-        debugAviso("[EspNowModulo] Versao incompativel: " + String(cab.versao));
-        return;
-    }
+    // Atualiza contato do dispositivo
+    Dispositivo* d = _registro.porMac(macOrigem);
+    if (d) { d->online = true; d->ultimoContato = millis(); }
 
     switch (cab.tipo) {
-        case TipoMsg::PING:
-            _registrarCentral(macOrigem);
-            _responderPing(macOrigem);
+        case _TipoInterno::PONG:
+            _processarPong(macOrigem, buf, tam);
             break;
-
-        case TipoMsg::PING_HEARTBEAT:
-            _responderHeartbeat(macOrigem);
+        case _TipoInterno::MENSAGEM:
+            _processarMensagem(macOrigem, buf, tam);
             break;
-
-        // Todos os tipos de comando são repassados ao callback
-        case TipoMsg::CMD_AC:
-        case TipoMsg::CMD_PROJETOR:
-        case TipoMsg::CMD_TV:
-        case TipoMsg::CMD_TELA:
-        case TipoMsg::CMD_LUZES:
-            if (_cbComando) _cbComando(buf, (uint8_t)tam);
+        case _TipoInterno::PONG_HB:
+            _processarPongHB(macOrigem);
             break;
-
         default:
-            debugVerbose("[EspNowModulo] TipoMsg desconhecido: 0x" +
-                         String((uint8_t)cab.tipo, HEX));
             break;
     }
 }
 
-void EspNowModulo::_responderPing(const uint8_t* macCentral)
+void EspNowMestre::_processarPong(const uint8_t* mac, const uint8_t* buf, int tam)
 {
-    MsgPong pong;
-    _preencherCabecalho(pong.cabecalho, TipoMsg::PONG, _id);
-    pong.tipo           = _tipo;
-    pong.versaoFirmware = _versaoFirmware;
-    strncpy(pong.label, _label, ESPNOW_MAX_LABEL - 1);
+    if (tam < _TAM_CAB + (int)sizeof(_PayloadPong)) return;
 
-    _enviar(macCentral,
-            reinterpret_cast<const uint8_t*>(&pong),
-            sizeof(pong));
+    _PayloadPong pp;
+    memcpy(&pp, buf + _TAM_CAB, sizeof(pp));
 
-    debugInfo("[EspNowModulo] PONG enviado ao central.");
+    _Cabecalho cab;
+    memcpy(&cab, buf, _TAM_CAB);
+
+    // Já está registrado? Atualiza contato e retorna
+    if (_registro.porMac(mac) != nullptr) return;
+
+    // Monta Dispositivo para o callback
+    Dispositivo d{};
+    memcpy(d.mac, mac, 6);
+    d.tipoDispositivo = pp.tipoDispositivo;
+    d.id              = cab.id;
+    d.versaoFirmware  = pp.versaoFirmware;
+    d.online          = true;
+    d.ultimoContato   = millis();
+    strncpy(d.label, pp.label, ESPNOW_MAX_LABEL - 1);
+
+    if (_cbEncontrado) _cbEncontrado(d);
 }
 
-void EspNowModulo::_responderHeartbeat(const uint8_t* macCentral)
+void EspNowMestre::_processarMensagem(const uint8_t* mac,
+                                       const uint8_t* buf, int tam)
 {
-    MsgHeartbeat hb;
-    _preencherCabecalho(hb.cabecalho, TipoMsg::PONG_HEARTBEAT, _id);
+    if (!_cbMensagem) return;
 
-    _enviar(macCentral,
-            reinterpret_cast<const uint8_t*>(&hb),
-            sizeof(hb));
+    _Cabecalho cab;
+    memcpy(&cab, buf, _TAM_CAB);
 
-    debugVerbose("[EspNowModulo] Heartbeat PONG enviado.");
-}
+    const uint8_t* payload    = buf + _TAM_CAB;
+    uint8_t        tamPayload = cab.tamPayload;
 
-void EspNowModulo::_registrarCentral(const uint8_t* mac)
-{
-    if (_centralRegistrado && _macsIguais(_macCentral, mac)) return;
+    // Garante que não lemos além do buffer recebido
+    if (_TAM_CAB + tamPayload > (uint8_t)tam) tamPayload = tam - _TAM_CAB;
 
-    memcpy(_macCentral, mac, 6);
-    _centralRegistrado = true;
-    _adicionarPeer(mac);
-
-    debugInfo("[EspNowModulo] Central registrado: " +
-              RegistroModulos::macParaString(mac));
-}
-
-// =============================================================================
-// EspNowModulo — internos de envio
-// =============================================================================
-
-bool EspNowModulo::_adicionarPeer(const uint8_t mac[6])
-{
-    if (esp_now_is_peer_exist(mac)) return true;
-
-    esp_now_peer_info_t peer{};
-    memcpy(peer.peer_addr, mac, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-
-    bool ok = (esp_now_add_peer(&peer) == ESP_OK);
-    if (!ok) {
-        debugErro("[EspNowModulo] Falha ao adicionar peer: " +
-                  RegistroModulos::macParaString(mac));
+    Dispositivo* d = _registro.porMac(mac);
+    if (d) {
+        _cbMensagem(*d, payload, tamPayload);
     }
-    return ok;
 }
 
-bool EspNowModulo::_enviar(const uint8_t mac[6],
+void EspNowMestre::_processarPongHB(const uint8_t* mac)
+{
+    Dispositivo* d = _registro.porMac(mac);
+    if (d) {
+        bool eraOffline = !d->online;
+        d->online        = true;
+        d->ultimoContato = millis();
+        if (eraOffline && _cbOnline) _cbOnline(*d);
+    }
+}
+
+// =============================================================================
+// EspNowMestre — internos de rede
+// =============================================================================
+
+bool EspNowMestre::_adicionarPeer(const uint8_t mac[6])
+{
+    return _adicionarPeerESP(mac);
+}
+
+bool EspNowMestre::_enviar(const uint8_t mac[6],
                              const uint8_t* dados, uint8_t tamanho)
 {
-    esp_err_t r = esp_now_send(mac, dados, tamanho);
-    if (r != ESP_OK) {
-        debugErro("[EspNowModulo] esp_now_send falhou (erro: " + String(r) + ")");
-        return false;
-    }
+    return esp_now_send(mac, dados, tamanho) == ESP_OK;
+}
+
+// =============================================================================
+// EspNowMestre — callbacks estáticos
+// =============================================================================
+
+void EspNowMestre::_onRecv(const esp_now_recv_info_t* info,
+                             const uint8_t* dados, int tam)
+{
+    if (!_instancia || _instancia->_temDados) return;
+    int copia = (tam > 250) ? 250 : tam;
+    memcpy((void*)_instancia->_bufRx, dados, copia);
+    memcpy(_instancia->_macRx, info->src_addr, 6);
+    _instancia->_tamRx    = copia;
+    _instancia->_temDados = true;
+}
+
+void EspNowMestre::_onSend(const uint8_t* mac, esp_now_send_status_t status)
+{
+    if (!_instancia) return;
+    bool ok = (status == ESP_NOW_SEND_SUCCESS);
+    if (_instancia->_cbEnvio) _instancia->_cbEnvio(mac, ok);
+}
+
+// =============================================================================
+// EspNowEscravo — inicialização
+// =============================================================================
+
+bool EspNowEscravo::begin(uint8_t tipoDispositivo, const char* label,
+                           uint8_t versaoFirmware)
+{
+    _instancia = this;
+    _tipo      = tipoDispositivo;
+    strncpy(_label, label, ESPNOW_MAX_LABEL - 1);
+    _versaoFirmware = versaoFirmware;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.macAddress(_mac);
+
+    if (esp_now_init() != ESP_OK) return false;
+
+    esp_now_register_recv_cb(_onRecv);
+    esp_now_register_send_cb(_onSend);
+
     return true;
 }
 
 // =============================================================================
-// EspNowModulo — callbacks estáticos (ISR-safe)
+// EspNowEscravo — loop
 // =============================================================================
 
-void EspNowModulo::_cbRecvEstatico(const esp_now_recv_info_t* info,
-                                    const uint8_t* dados, int tamanho)
+void EspNowEscravo::atualizar()
 {
-    if (!_instancia || _instancia->_temDados) return;
-
-    int copia = (tamanho > 250) ? 250 : tamanho;
-    memcpy((void*)_instancia->_bufferRx, dados, copia);
-    memcpy(_instancia->_macRx, info->src_addr, 6);
-    _instancia->_tamanhoRx = copia;
-    _instancia->_temDados  = true;
+    _processar();
 }
 
-void EspNowModulo::_cbSendEstatico(const uint8_t* mac,
-                                    esp_now_send_status_t status)
+// =============================================================================
+// EspNowEscravo — comunicação
+// =============================================================================
+
+bool EspNowEscravo::responder(const void* dados, uint8_t tamanho)
+{
+    if (!_mestreRegistrado) return false;
+    if (tamanho > ESPNOW_MAX_PAYLOAD) tamanho = ESPNOW_MAX_PAYLOAD;
+
+    uint8_t buf[_TAM_CAB + ESPNOW_MAX_PAYLOAD];
+    _Cabecalho cab;
+    _preencherCab(cab, _TipoInterno::MENSAGEM, _id, tamanho);
+    memcpy(buf, &cab, _TAM_CAB);
+    memcpy(buf + _TAM_CAB, dados, tamanho);
+    return _enviar(_macMestre, buf, _TAM_CAB + tamanho);
+}
+
+String EspNowEscravo::macMestre() const
+{
+    if (!_mestreRegistrado) return "";
+    return RegistroDispositivos::macParaString(_macMestre);
+}
+
+String EspNowEscravo::mac() const
+{
+    return RegistroDispositivos::macParaString(_mac);
+}
+
+// =============================================================================
+// EspNowEscravo — processamento do buffer
+// =============================================================================
+
+void EspNowEscravo::_processar()
+{
+    if (!_temDados) return;
+
+    uint8_t buf[250];
+    int     tam;
+    uint8_t macOrigem[6];
+
+    noInterrupts();
+    tam = _tamRx;
+    memcpy(buf, _bufRx, tam);
+    memcpy(macOrigem, _macRx, 6);
+    _temDados = false;
+    interrupts();
+
+    if (tam < _TAM_CAB) return;
+
+    _Cabecalho cab;
+    memcpy(&cab, buf, _TAM_CAB);
+    if (cab.versao != ESPNOW_VERSAO_PROTOCOLO) return;
+
+    switch (cab.tipo) {
+        case _TipoInterno::PING:
+            _registrarMestre(macOrigem);
+            _responderPing(macOrigem, cab.id);
+            break;
+
+        case _TipoInterno::MENSAGEM:
+            if (_cbMensagem) {
+                const uint8_t* payload    = buf + _TAM_CAB;
+                uint8_t        tamPayload = cab.tamPayload;
+                if (_TAM_CAB + tamPayload > (uint8_t)tam)
+                    tamPayload = tam - _TAM_CAB;
+                _cbMensagem(payload, tamPayload);
+            }
+            break;
+
+        case _TipoInterno::PING_HB:
+            _responderHeartbeat();
+            break;
+
+        default:
+            break;
+    }
+}
+
+void EspNowEscravo::_responderPing(const uint8_t* macMestre, uint8_t idRecebido)
+{
+    _PayloadPong pp{};
+    pp.tipoDispositivo = _tipo;
+    pp.versaoFirmware  = _versaoFirmware;
+    strncpy(pp.label, _label, ESPNOW_MAX_LABEL - 1);
+
+    uint8_t buf[_TAM_CAB + sizeof(_PayloadPong)];
+    _Cabecalho cab;
+    _preencherCab(cab, _TipoInterno::PONG, _id, sizeof(_PayloadPong));
+    memcpy(buf, &cab, _TAM_CAB);
+    memcpy(buf + _TAM_CAB, &pp, sizeof(pp));
+
+    _enviar(macMestre, buf, sizeof(buf));
+}
+
+void EspNowEscravo::_responderHeartbeat()
+{
+    if (!_mestreRegistrado) return;
+    uint8_t buf[_TAM_CAB];
+    _Cabecalho cab;
+    _preencherCab(cab, _TipoInterno::PONG_HB, _id);
+    memcpy(buf, &cab, _TAM_CAB);
+    _enviar(_macMestre, buf, _TAM_CAB);
+}
+
+void EspNowEscravo::_registrarMestre(const uint8_t* mac)
+{
+    if (_mestreRegistrado && _macsIguais(_macMestre, mac)) return;
+
+    memcpy(_macMestre, mac, 6);
+    _mestreRegistrado = true;
+    _adicionarPeer(mac);
+
+    if (_cbMestre) _cbMestre(mac, true);
+}
+
+// =============================================================================
+// EspNowEscravo — internos de rede
+// =============================================================================
+
+bool EspNowEscravo::_adicionarPeer(const uint8_t mac[6])
+{
+    return _adicionarPeerESP(mac);
+}
+
+bool EspNowEscravo::_enviar(const uint8_t mac[6],
+                              const uint8_t* dados, uint8_t tamanho)
+{
+    return esp_now_send(mac, dados, tamanho) == ESP_OK;
+}
+
+// =============================================================================
+// EspNowEscravo — callbacks estáticos
+// =============================================================================
+
+void EspNowEscravo::_onRecv(const esp_now_recv_info_t* info,
+                              const uint8_t* dados, int tam)
+{
+    if (!_instancia || _instancia->_temDados) return;
+    int copia = (tam > 250) ? 250 : tam;
+    memcpy((void*)_instancia->_bufRx, dados, copia);
+    memcpy(_instancia->_macRx, info->src_addr, 6);
+    _instancia->_tamRx    = copia;
+    _instancia->_temDados = true;
+}
+
+void EspNowEscravo::_onSend(const uint8_t* mac, esp_now_send_status_t status)
 {
     if (!_instancia) return;
     bool ok = (status == ESP_NOW_SEND_SUCCESS);
-    if (!ok) {
-        debugAviso("[EspNowModulo] Falha de entrega ao central.");
-    }
     if (_instancia->_cbEnvio) _instancia->_cbEnvio(mac, ok);
 }
