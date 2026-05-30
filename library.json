@@ -1,6 +1,6 @@
 {
   "name": "ESP32EspNow",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Infraestrutura ESP-NOW para sistemas mestre/escravo no ESP32. Oferece descoberta automatica de dispositivos, registro persistente no NVS e troca de mensagens com payload livre — sem impor protocolo de aplicacao.",
   "keywords": [
     "ESP-NOW", "ESP32", "mestre", "escravo", "master", "slave",

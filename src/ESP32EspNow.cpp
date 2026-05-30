@@ -3,37 +3,48 @@
  * @brief Implementação da biblioteca ESP32EspNow.
  *
  * @author  professorThiago (https://github.com/professorThiago)
- * @version 2.0.0
+ * @version 2.1.0
  * @license MIT
  */
 
 #include "ESP32EspNow.h"
 
 // =============================================================================
-// Protocolo interno — cabeçalho de 9 bytes
+// Protocolo interno — cabeçalho de 10 bytes
 // Invisível ao projeto — usado apenas entre instâncias desta biblioteca.
+//
+// Layout:
+//   [ versao(1) | tipo(1) | addr(1) | id(1) | ts(4) | tamPayload(1) | rsv(1) ]
+//
+// Campo addr:
+//   ESPNOW_ADDR_NENHUM (0)    → endereçamento desativado, aceito por todos
+//   ESPNOW_ADDR_BROADCAST(63) → PING de descoberta, aceito por todos com addr>0
+//   1–62                      → só aceito por dispositivos do mesmo addr
 // =============================================================================
 
 enum class _TipoInterno : uint8_t {
-    PING          = 0xA1,  // mestre → broadcast: quem está aqui?
-    PONG          = 0xA2,  // escravo → mestre: sou eu (tipo + label + fw)
-    MENSAGEM      = 0xA3,  // qualquer direção: payload livre do projeto
-    PING_HB       = 0xA4,  // mestre → escravo: heartbeat
-    PONG_HB       = 0xA5,  // escravo → mestre: resposta ao heartbeat
+    PING     = 0xA1,  // mestre → broadcast
+    PONG     = 0xA2,  // escravo → mestre
+    MENSAGEM = 0xA3,  // payload livre
+    PING_HB  = 0xA4,  // heartbeat
+    PONG_HB  = 0xA5,  // resposta heartbeat
 };
 
 struct __attribute__((packed)) _Cabecalho {
-    uint8_t      versao  = ESPNOW_VERSAO_PROTOCOLO;
+    uint8_t      versao      = ESPNOW_VERSAO_PROTOCOLO;
     _TipoInterno tipo;
-    uint8_t      id      = 0;   // ID lógico do remetente (0 = não cadastrado)
-    uint32_t     ts      = 0;   // millis() do remetente
-    uint8_t      tamPayload = 0;
+    uint8_t      addr        = ESPNOW_ADDR_NENHUM; ///< endereço 6 bits do remetente
+    uint8_t      id          = 0;
+    uint32_t     ts          = 0;
+    uint8_t      tamPayload  = 0;
+    uint8_t      _rsv        = 0;  // reservado — alinhamento e expansão futura
 };
 
 // Layout do PONG — payload fixo após o cabeçalho
 struct __attribute__((packed)) _PayloadPong {
     uint8_t tipoDispositivo;
     uint8_t versaoFirmware;
+    uint8_t enderecoSala;           ///< addr do escravo (0 = sem endereçamento)
     char    label[ESPNOW_MAX_LABEL];
 };
 
@@ -56,13 +67,39 @@ static bool _macsIguais(const uint8_t a[6], const uint8_t b[6])
 }
 
 static void _preencherCab(_Cabecalho& cab, _TipoInterno tipo,
+                           uint8_t addr = ESPNOW_ADDR_NENHUM,
                            uint8_t id = 0, uint8_t tamPayload = 0)
 {
     cab.versao      = ESPNOW_VERSAO_PROTOCOLO;
     cab.tipo        = tipo;
+    cab.addr        = addr;
     cab.id          = id;
     cab.ts          = millis();
     cab.tamPayload  = tamPayload;
+    cab._rsv        = 0;
+}
+
+/**
+ * @brief Lê os 6 pinos de jumper e retorna o endereço de 6 bits.
+ *
+ * Jumper fechado (pino a GND) = bit 1, aberto (pull-up) = bit 0.
+ * Retorna ESPNOW_ADDR_NENHUM (0) se todos abertos (inválido).
+ */
+static uint8_t _lerJumpers(const uint8_t pinos[ESPNOW_BITS_ENDERECO])
+{
+    uint8_t addr = 0;
+    for (uint8_t i = 0; i < ESPNOW_BITS_ENDERECO; i++) {
+        pinMode(pinos[i], INPUT_PULLUP);
+    }
+    // Pequeno delay para estabilizar os pull-ups antes da leitura
+    delay(5);
+    for (uint8_t i = 0; i < ESPNOW_BITS_ENDERECO; i++) {
+        // Jumper fechado = LOW = bit ativo
+        if (digitalRead(pinos[i]) == LOW) {
+            addr |= (1 << i);
+        }
+    }
+    return addr;
 }
 
 static bool _adicionarPeerESP(const uint8_t mac[6])
@@ -73,6 +110,32 @@ static bool _adicionarPeerESP(const uint8_t mac[6])
     p.channel = 0;
     p.encrypt = false;
     return esp_now_add_peer(&p) == ESP_OK;
+}
+
+/**
+ * @brief Verifica se um endereço recebido deve ser aceito por este dispositivo.
+ *
+ * Regra:
+ *  - Se o filtro local está desativado (_addrAtivo=false): aceita tudo.
+ *  - PING/BROADCAST (addr=ESPNOW_ADDR_BROADCAST): aceita se addr local > 0.
+ *  - Endereço sem filtro (addr=0): aceita sempre (compatibilidade).
+ *  - Caso contrário: só aceita se addr == _addr local.
+ */
+static bool _deveAceitar(bool addrAtivo, uint8_t addrLocal,
+                          uint8_t addrPacote, _TipoInterno tipo)
+{
+    // Filtro desativado — aceita tudo (modo transparente)
+    if (!addrAtivo) return true;
+
+    // PING de descoberta com addr de broadcast — aceita se temos addr válido
+    if (tipo == _TipoInterno::PING && addrPacote == ESPNOW_ADDR_BROADCAST)
+        return addrLocal >= ESPNOW_ADDR_MIN;
+
+    // Pacote sem endereçamento — aceita (compatibilidade com dispositivos sem jumper)
+    if (addrPacote == ESPNOW_ADDR_NENHUM) return true;
+
+    // Filtra pelo endereço
+    return addrPacote == addrLocal;
 }
 
 // =============================================================================
@@ -254,10 +317,34 @@ bool EspNowMestre::begin(const char* sistemaId, const char* nsNVS)
 
     _registro.begin(nsNVS);
 
-    // Reregistra todos os peers salvos
     for (uint8_t i = 0; i < _registro.total(); i++)
         _adicionarPeer(_registro.porIndice(i).mac);
 
+    return true;
+}
+
+bool EspNowMestre::configurarEnderecoFisico(const uint8_t pinos[ESPNOW_BITS_ENDERECO])
+{
+    uint8_t addr = _lerJumpers(pinos);
+    return configurarEnderecoPorSoftware(addr);
+}
+
+bool EspNowMestre::configurarEnderecoPorSoftware(uint8_t addr)
+{
+    if (addr == ESPNOW_ADDR_NENHUM) {
+        Serial.println("[EspNowMestre] ERRO: endereco 0 invalido. "
+                       "Configure os jumpers antes de ligar o dispositivo.");
+        return false;
+    }
+    if (addr > ESPNOW_ADDR_MAX) {
+        Serial.println("[EspNowMestre] ERRO: endereco " + String(addr) +
+                       " reservado (max=" + String(ESPNOW_ADDR_MAX) + ").");
+        return false;
+    }
+    _addr      = addr;
+    _addrAtivo = true;
+    Serial.println("[EspNowMestre] Endereco fisico: " + String(_addr) +
+                   " (0b" + String(_addr, BIN) + ")");
     return true;
 }
 
@@ -293,7 +380,10 @@ void EspNowMestre::iniciarDescoberta(uint32_t timeoutMs)
 
     uint8_t buf[_TAM_CAB];
     _Cabecalho cab;
-    _preencherCab(cab, _TipoInterno::PING);
+    // PING usa addr=BROADCAST para que escravos com qualquer addr respondam
+    // mas só os do mesmo addr do mestre serão aceitos pelo filtro deles
+    uint8_t addrPing = _addrAtivo ? ESPNOW_ADDR_BROADCAST : ESPNOW_ADDR_NENHUM;
+    _preencherCab(cab, _TipoInterno::PING, addrPing);
     memcpy(buf, &cab, _TAM_CAB);
     _enviar(broadcast, buf, _TAM_CAB);
 }
@@ -345,7 +435,7 @@ bool EspNowMestre::enviarPorMac(const uint8_t mac[6],
 
     uint8_t buf[_TAM_CAB + ESPNOW_MAX_PAYLOAD];
     _Cabecalho cab;
-    _preencherCab(cab, _TipoInterno::MENSAGEM, 0, tamanho);
+    _preencherCab(cab, _TipoInterno::MENSAGEM, _addr, 0, tamanho);
     memcpy(buf, &cab, _TAM_CAB);
     memcpy(buf + _TAM_CAB, dados, tamanho);
     return _enviar(mac, buf, _TAM_CAB + tamanho);
@@ -398,7 +488,7 @@ void EspNowMestre::enviarHeartbeat()
 {
     uint8_t buf[_TAM_CAB];
     _Cabecalho cab;
-    _preencherCab(cab, _TipoInterno::PING_HB);
+    _preencherCab(cab, _TipoInterno::PING_HB, _addr);
     memcpy(buf, &cab, _TAM_CAB);
 
     for (uint8_t i = 0; i < _registro.total(); i++)
@@ -458,22 +548,18 @@ void EspNowMestre::_processar()
     memcpy(&cab, buf, _TAM_CAB);
     if (cab.versao != ESPNOW_VERSAO_PROTOCOLO) return;
 
-    // Atualiza contato do dispositivo
+    // ── Filtro de endereço ────────────────────────────────────────────────
+    if (!_deveAceitar(_addrAtivo, _addr, cab.addr, cab.tipo)) return;
+
+    // Atualiza contato
     Dispositivo* d = _registro.porMac(macOrigem);
     if (d) { d->online = true; d->ultimoContato = millis(); }
 
     switch (cab.tipo) {
-        case _TipoInterno::PONG:
-            _processarPong(macOrigem, buf, tam);
-            break;
-        case _TipoInterno::MENSAGEM:
-            _processarMensagem(macOrigem, buf, tam);
-            break;
-        case _TipoInterno::PONG_HB:
-            _processarPongHB(macOrigem);
-            break;
-        default:
-            break;
+        case _TipoInterno::PONG:    _processarPong(macOrigem, buf, tam);    break;
+        case _TipoInterno::MENSAGEM:_processarMensagem(macOrigem, buf, tam);break;
+        case _TipoInterno::PONG_HB: _processarPongHB(macOrigem);            break;
+        default: break;
     }
 }
 
@@ -487,15 +573,14 @@ void EspNowMestre::_processarPong(const uint8_t* mac, const uint8_t* buf, int ta
     _Cabecalho cab;
     memcpy(&cab, buf, _TAM_CAB);
 
-    // Já está registrado? Atualiza contato e retorna
     if (_registro.porMac(mac) != nullptr) return;
 
-    // Monta Dispositivo para o callback
     Dispositivo d{};
     memcpy(d.mac, mac, 6);
     d.tipoDispositivo = pp.tipoDispositivo;
     d.id              = cab.id;
     d.versaoFirmware  = pp.versaoFirmware;
+    d.enderecoSala    = pp.enderecoSala;   // addr físico do escravo
     d.online          = true;
     d.ultimoContato   = millis();
     strncpy(d.label, pp.label, ESPNOW_MAX_LABEL - 1);
@@ -594,6 +679,31 @@ bool EspNowEscravo::begin(uint8_t tipoDispositivo, const char* label,
     return true;
 }
 
+bool EspNowEscravo::configurarEnderecoFisico(const uint8_t pinos[ESPNOW_BITS_ENDERECO])
+{
+    uint8_t addr = _lerJumpers(pinos);
+    return configurarEnderecoPorSoftware(addr);
+}
+
+bool EspNowEscravo::configurarEnderecoPorSoftware(uint8_t addr)
+{
+    if (addr == ESPNOW_ADDR_NENHUM) {
+        Serial.println("[EspNowEscravo] ERRO: endereco 0 invalido. "
+                       "Configure os jumpers antes de ligar o dispositivo.");
+        return false;
+    }
+    if (addr > ESPNOW_ADDR_MAX) {
+        Serial.println("[EspNowEscravo] ERRO: endereco " + String(addr) +
+                       " reservado (max=" + String(ESPNOW_ADDR_MAX) + ").");
+        return false;
+    }
+    _addr      = addr;
+    _addrAtivo = true;
+    Serial.println("[EspNowEscravo] Endereco fisico: " + String(_addr) +
+                   " (0b" + String(_addr, BIN) + ")");
+    return true;
+}
+
 // =============================================================================
 // EspNowEscravo — loop
 // =============================================================================
@@ -614,7 +724,7 @@ bool EspNowEscravo::responder(const void* dados, uint8_t tamanho)
 
     uint8_t buf[_TAM_CAB + ESPNOW_MAX_PAYLOAD];
     _Cabecalho cab;
-    _preencherCab(cab, _TipoInterno::MENSAGEM, _id, tamanho);
+    _preencherCab(cab, _TipoInterno::MENSAGEM, _addr, _id, tamanho);
     memcpy(buf, &cab, _TAM_CAB);
     memcpy(buf + _TAM_CAB, dados, tamanho);
     return _enviar(_macMestre, buf, _TAM_CAB + tamanho);
@@ -656,12 +766,14 @@ void EspNowEscravo::_processar()
     memcpy(&cab, buf, _TAM_CAB);
     if (cab.versao != ESPNOW_VERSAO_PROTOCOLO) return;
 
+    // ── Filtro de endereço ────────────────────────────────────────────────
+    if (!_deveAceitar(_addrAtivo, _addr, cab.addr, cab.tipo)) return;
+
     switch (cab.tipo) {
         case _TipoInterno::PING:
             _registrarMestre(macOrigem);
             _responderPing(macOrigem, cab.id);
             break;
-
         case _TipoInterno::MENSAGEM:
             if (_cbMensagem) {
                 const uint8_t* payload    = buf + _TAM_CAB;
@@ -671,11 +783,9 @@ void EspNowEscravo::_processar()
                 _cbMensagem(payload, tamPayload);
             }
             break;
-
         case _TipoInterno::PING_HB:
             _responderHeartbeat();
             break;
-
         default:
             break;
     }
@@ -686,11 +796,13 @@ void EspNowEscravo::_responderPing(const uint8_t* macMestre, uint8_t idRecebido)
     _PayloadPong pp{};
     pp.tipoDispositivo = _tipo;
     pp.versaoFirmware  = _versaoFirmware;
+    pp.enderecoSala    = _addr;   // envia o addr físico para o mestre
     strncpy(pp.label, _label, ESPNOW_MAX_LABEL - 1);
 
     uint8_t buf[_TAM_CAB + sizeof(_PayloadPong)];
     _Cabecalho cab;
-    _preencherCab(cab, _TipoInterno::PONG, _id, sizeof(_PayloadPong));
+    // PONG inclui o addr do escravo para que o mestre possa exibi-lo
+    _preencherCab(cab, _TipoInterno::PONG, _addr, _id, sizeof(_PayloadPong));
     memcpy(buf, &cab, _TAM_CAB);
     memcpy(buf + _TAM_CAB, &pp, sizeof(pp));
 
@@ -702,7 +814,7 @@ void EspNowEscravo::_responderHeartbeat()
     if (!_mestreRegistrado) return;
     uint8_t buf[_TAM_CAB];
     _Cabecalho cab;
-    _preencherCab(cab, _TipoInterno::PONG_HB, _id);
+    _preencherCab(cab, _TipoInterno::PONG_HB, _addr, _id);
     memcpy(buf, &cab, _TAM_CAB);
     _enviar(_macMestre, buf, _TAM_CAB);
 }

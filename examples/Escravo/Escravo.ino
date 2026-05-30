@@ -1,129 +1,70 @@
 /**
  * @file Escravo.ino
- * @brief Exemplo de dispositivo escravo que responde ao mestre.
+ * @brief Exemplo de escravo com endereçamento por jumper.
  *
- * ## O que este exemplo faz
+ * O escravo SÓ responde ao mestre do mesmo endereço.
+ * Comente configurarEnderecoFisico() para modo sem isolamento.
  *
- * 1. Inicializa o ESP-NOW como escravo (tipo=1, label="sensor-01").
- * 2. Aguarda o PING de descoberta do mestre.
- * 3. Ao receber um comando, processa e envia resposta.
- * 4. Responde automaticamente ao heartbeat do mestre.
- *
- * @author  professorThiago
- * @version 2.0.0
+ * @author  professorThiago  @version 2.1.0
  */
 
 #include <ESP32EspNow.h>
 
-// ---------------------------------------------------------------------------
-// Payload definido PELO PROJETO — deve ser igual no mestre e no escravo
-// ---------------------------------------------------------------------------
+const uint8_t JUMPERS[ESPNOW_BITS_ENDERECO] = {4, 5, 6, 7, 8, 9};
 
-struct __attribute__((packed)) CmdMestre {
-    uint8_t  acao;
-    uint8_t  valor;
-    uint32_t sequencia;
-};
-
-struct __attribute__((packed)) RespostaEscravo {
-    uint8_t  status;
-    uint32_t leitura;
-    uint32_t sequencia;
-};
-
-// ---------------------------------------------------------------------------
-// Tipo de dispositivo definido pelo projeto
-// ---------------------------------------------------------------------------
 static constexpr uint8_t TIPO_SENSOR = 1;
 
-// ---------------------------------------------------------------------------
-// Instância global do escravo
-// ---------------------------------------------------------------------------
+struct __attribute__((packed)) CmdMestre   { uint8_t acao; uint8_t valor; uint16_t seq; };
+struct __attribute__((packed)) RespEscravo { uint8_t status; uint32_t leitura; uint16_t seq; };
+
 EspNowEscravo escravo;
 
-// ---------------------------------------------------------------------------
-// setup()
-// ---------------------------------------------------------------------------
 void setup() {
-    Serial.begin(115200);
-    delay(500);
-    Serial.println("\n=== ESP32EspNow — Exemplo Escravo ===\n");
+    Serial.begin(115200); delay(500);
+    Serial.println("\n=== ESP32EspNow v2.1 — Escravo ===\n");
 
     if (!escravo.begin(TIPO_SENSOR, "sensor-01")) {
-        Serial.println("ERRO: falha ao iniciar ESP-NOW!");
-        while (true) delay(1000);
+        Serial.println("ERRO: ESP-NOW falhou!"); while (true) delay(1000);
     }
 
-    Serial.println("MAC: " + escravo.mac());
-    Serial.println("Aguardando PING do mestre...\n");
+    // Endereçamento por jumper — comente para modo genérico
+    if (!escravo.configurarEnderecoFisico(JUMPERS)) {
+        Serial.println("ATENCAO: addr=0, modo sem isolamento de sala.");
+    }
+    // Alternativa: escravo.configurarEnderecoPorSoftware(3);
 
-    // Callback quando o mestre é identificado pela primeira vez
+    Serial.println("MAC  : " + escravo.mac());
+    Serial.println("Addr : " + String(escravo.endereco()) +
+                   (escravo.endereco() > 0 ? " (filtro ON)" : " (filtro OFF)"));
+    Serial.println("Aguardando PING do mestre addr=" +
+                   String(escravo.endereco()) + "...\n");
+
     escravo.aoConectarMestre([](const uint8_t* mac, bool ok) {
-        Serial.println("[+] Mestre identificado: " +
-                       RegistroDispositivos::macParaString(mac));
+        Serial.println("[+] Mestre: " + RegistroDispositivos::macParaString(mac));
     });
 
-    // Callback de mensagem recebida do mestre
     escravo.aoReceberMensagem([](const uint8_t* dados, uint8_t tam) {
-        if (tam < sizeof(CmdMestre)) {
-            Serial.println("[!] Payload menor que esperado (" +
-                           String(tam) + " bytes)");
-            return;
-        }
+        if (tam < sizeof(CmdMestre)) return;
 
-        CmdMestre cmd;
-        memcpy(&cmd, dados, sizeof(cmd));
-
-        Serial.println("[<] Cmd acao=" + String(cmd.acao) +
+        CmdMestre cmd; memcpy(&cmd, dados, sizeof(cmd));
+        Serial.println("[<] acao=" + String(cmd.acao) +
                        " valor=" + String(cmd.valor) +
-                       " seq=" + String(cmd.sequencia));
+                       " seq=" + String(cmd.seq));
 
-        // Monta resposta
-        RespostaEscravo resp;
-        resp.sequencia = cmd.sequencia;
+        RespEscravo r;
+        r.seq     = cmd.seq;
+        r.status  = 0;
+        r.leitura = (cmd.acao == 3) ? (uint32_t)analogRead(34) : 0;
 
-        switch (cmd.acao) {
-            case 0:  // ping
-                resp.status  = 0;
-                resp.leitura = 0;
-                break;
-            case 1:  // ligar
-                resp.status  = 0;
-                resp.leitura = 1;
-                Serial.println("    -> Ligando...");
-                break;
-            case 2:  // desligar
-                resp.status  = 0;
-                resp.leitura = 0;
-                Serial.println("    -> Desligando...");
-                break;
-            case 3:  // ler
-                resp.status  = 0;
-                resp.leitura = analogRead(34); // leitura de exemplo
-                Serial.println("    -> Leitura: " + String(resp.leitura));
-                break;
-            default:
-                resp.status  = 1; // erro: ação desconhecida
-                resp.leitura = 0;
-                break;
-        }
-
-        // Envia resposta ao mestre
-        if (escravo.responder(&resp, sizeof(resp))) {
-            Serial.println("[>] Resposta enviada (seq=" +
-                           String(resp.sequencia) + ")");
-        }
+        if (escravo.responder(&r, sizeof(r)))
+            Serial.println("[>] Resposta enviada leitura=" + String(r.leitura));
     });
 
-    // Callback de envio (opcional — útil para debug)
     escravo.aoEnviar([](const uint8_t* mac, bool ok) {
-        if (!ok) Serial.println("[!] Falha ao enviar resposta ao mestre.");
+        if (!ok) Serial.println("[!] Falha ao enviar ao mestre.");
     });
 }
 
-// ---------------------------------------------------------------------------
-// loop()
-// ---------------------------------------------------------------------------
 void loop() {
-    escravo.atualizar();  // processa recepção e responde heartbeats
+    escravo.atualizar();
 }
